@@ -59,6 +59,8 @@ import (
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
+const checkpointCacheDir = "checkpoint-cache"
+
 // checkIfCheckpointOCIImage returns checks if the input refers to a checkpoint image.
 // It returns the StorageImageID of the image the input resolves to, nil otherwise.
 func (c *criService) checkIfCheckpointOCIImage(ctx context.Context, input string) (string, error) {
@@ -107,13 +109,101 @@ func (c *criService) checkIfCheckpointOCIImage(ctx context.Context, input string
 	return image.ID, nil
 }
 
+func (c *criService) getCheckpointCacheDir(key string) string {
+	return filepath.Join(c.config.RootDir, checkpointCacheDir, key)
+}
+
+func checkpointCacheReady(cacheDir string) bool {
+	required := []string{
+		crmetadata.CheckpointDirectory,
+		crmetadata.SpecDumpFile,
+		crmetadata.ConfigDumpFile,
+		crmetadata.StatusDumpFile,
+	}
+	for _, path := range required {
+		if _, err := os.Stat(filepath.Join(cacheDir, path)); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func populateCheckpointCache(ctx context.Context, cacheDir, sourceDir string) error {
+	if checkpointCacheReady(cacheDir) {
+		log.G(ctx).Infof("Checkpoint cache already populated: %s", cacheDir)
+		return nil
+	}
+	if _, err := os.Stat(cacheDir); err == nil {
+		return fmt.Errorf("checkpoint cache %q exists but is incomplete; remove it manually before retrying", cacheDir)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat checkpoint cache %q: %w", cacheDir, err)
+	}
+
+	parentDir := filepath.Dir(cacheDir)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create checkpoint cache parent %q: %w", parentDir, err)
+	}
+	log.G(ctx).Infof("Populating checkpoint cache %s from %s", cacheDir, sourceDir)
+
+	tempDir, err := os.MkdirTemp(parentDir, filepath.Base(cacheDir)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("failed to create checkpoint cache temp dir: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil && !os.IsNotExist(err) {
+			log.G(ctx).WithError(err).Warnf("failed to remove checkpoint cache temp dir %q", tempDir)
+		}
+	}()
+
+	if err := fs.CopyDir(tempDir, sourceDir); err != nil {
+		return fmt.Errorf("failed to populate checkpoint cache from %q: %w", sourceDir, err)
+	}
+
+	if err := os.Rename(tempDir, cacheDir); err != nil {
+		if checkpointCacheReady(cacheDir) {
+			log.G(ctx).Infof("Checkpoint cache became ready concurrently: %s", cacheDir)
+			return nil
+		}
+		return fmt.Errorf("failed to publish checkpoint cache %q: %w", cacheDir, err)
+	}
+	log.G(ctx).Infof("Published checkpoint cache %s", cacheDir)
+	return nil
+}
+
+func symlinkCheckpointCache(cacheDir, containerRootDir string) error {
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return fmt.Errorf("failed to read checkpoint cache %q: %w", cacheDir, err)
+	}
+
+	for _, entry := range entries {
+		dst := filepath.Join(containerRootDir, entry.Name())
+		if _, err := os.Lstat(dst); err == nil {
+			return fmt.Errorf("cannot link checkpoint cache entry %q: destination exists", dst)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to stat checkpoint cache destination %q: %w", dst, err)
+		}
+
+		src := filepath.Join(cacheDir, entry.Name())
+		if err := os.Symlink(src, dst); err != nil {
+			return fmt.Errorf("failed to symlink checkpoint cache entry %q -> %q: %w", dst, src, err)
+		}
+	}
+	return nil
+}
+
 func (c *criService) CRImportCheckpoint(
 	ctx context.Context,
 	meta *containerstore.Metadata,
 	sandbox *sandbox.Sandbox,
 	sandboxConfig *runtime.PodSandboxConfig,
 ) (ctrID string, retErr error) {
-	var mountPoint string
+	var (
+		mountPoint string
+		sourceRoot string
+		cacheRoot  string
+		mounted    bool
+	)
 	start := time.Now()
 	// Ensure that the image to restore the checkpoint from has been provided.
 	if meta.Config.Image == nil || meta.Config.Image.Image == "" {
@@ -134,6 +224,11 @@ func (c *criService) CRImportCheckpoint(
 		return "", err
 	}
 	defer func() {
+		if mounted {
+			if err := mount.UnmountAll(mountPoint, 0); err != nil {
+				log.G(ctx).WithError(err).Errorf("Could not unmount checkpoint view %s", mountPoint)
+			}
+		}
 		if err := os.RemoveAll(mountPoint); err != nil {
 			log.G(ctx).Errorf("Could not recursively remove %s: %q", mountPoint, err)
 		}
@@ -156,23 +251,39 @@ func (c *criService) CRImportCheckpoint(
 			return "", err
 		}
 		chainID := identity.ChainID(diffIDs).String()
+		cacheRoot = c.getCheckpointCacheDir(chainID)
 		ociRuntime, err := c.config.GetSandboxRuntime(sandboxConfig, sandbox.Metadata.RuntimeHandler)
 		if err != nil {
 			return "", fmt.Errorf("failed to get sandbox runtime: %w", err)
 		}
-		s := c.client.SnapshotService(c.RuntimeSnapshotter(ctx, ociRuntime))
+		if checkpointCacheReady(cacheRoot) {
+			sourceRoot = cacheRoot
+			log.G(ctx).Infof("Using checkpoint cache %s for %s", cacheRoot, inputImage)
+		} else {
+			s := c.client.SnapshotService(c.RuntimeSnapshotter(ctx, ociRuntime))
 
-		mounts, err := s.View(ctx, mountPoint, chainID)
-		if err != nil {
-			if errdefs.IsAlreadyExists(err) {
-				mounts, err = s.Mounts(ctx, mountPoint)
-			}
+			mounts, err := s.View(ctx, mountPoint, chainID)
 			if err != nil {
+				if errdefs.IsAlreadyExists(err) {
+					mounts, err = s.Mounts(ctx, mountPoint)
+				}
+				if err != nil {
+					return "", err
+				}
+			}
+			if err := mount.All(mounts, mountPoint); err != nil {
 				return "", err
 			}
-		}
-		if err := mount.All(mounts, mountPoint); err != nil {
-			return "", err
+			mounted = true
+
+			if err := populateCheckpointCache(ctx, cacheRoot, mountPoint); err != nil {
+				return "", err
+			}
+			if err := mount.UnmountAll(mountPoint, 0); err != nil {
+				return "", err
+			}
+			mounted = false
+			sourceRoot = cacheRoot
 		}
 	} else {
 
@@ -219,22 +330,23 @@ func (c *criService) CRImportCheckpoint(
 			return "", fmt.Errorf("unpacking of checkpoint archive %s failed: %w", mountPoint, err)
 		}
 		log.G(ctx).Debugf("Unpacked checkpoint in %s", mountPoint)
+		sourceRoot = mountPoint
 	}
 	// Load spec.dump from temporary directory
 	dumpSpec := new(spec.Spec)
-	if _, err := crmetadata.ReadJSONFile(dumpSpec, mountPoint, crmetadata.SpecDumpFile); err != nil {
+	if _, err := crmetadata.ReadJSONFile(dumpSpec, sourceRoot, crmetadata.SpecDumpFile); err != nil {
 		return "", fmt.Errorf("failed to read %q: %w", crmetadata.SpecDumpFile, err)
 	}
 
 	// Load config.dump from temporary directory
 	config := new(crmetadata.ContainerConfig)
-	if _, err := crmetadata.ReadJSONFile(config, mountPoint, crmetadata.ConfigDumpFile); err != nil {
+	if _, err := crmetadata.ReadJSONFile(config, sourceRoot, crmetadata.ConfigDumpFile); err != nil {
 		return "", fmt.Errorf("failed to read %q: %w", crmetadata.ConfigDumpFile, err)
 	}
 
 	// Load status.dump from temporary directory
 	containerStatus := new(runtime.ContainerStatus)
-	if _, err := crmetadata.ReadJSONFile(containerStatus, mountPoint, crmetadata.StatusDumpFile); err != nil {
+	if _, err := crmetadata.ReadJSONFile(containerStatus, sourceRoot, crmetadata.StatusDumpFile); err != nil {
 		return "", fmt.Errorf("failed to read %q: %w", crmetadata.StatusDumpFile, err)
 	}
 
@@ -402,10 +514,7 @@ func (c *criService) CRImportCheckpoint(
 	}
 
 	if restoreStorageImageID != "" {
-		if err := fs.CopyDir(containerRootDir, mountPoint); err != nil {
-			return "", err
-		}
-		if err := mount.UnmountAll(mountPoint, 0); err != nil {
+		if err := symlinkCheckpointCache(cacheRoot, containerRootDir); err != nil {
 			return "", err
 		}
 	} else {
