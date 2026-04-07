@@ -420,16 +420,43 @@ func (c *criService) CRImportCheckpoint(
 		}
 	}
 
-	// Pulling the image the checkpoint is based on. This is a bit different
-	// than automatic image pulling. The checkpoint image is not automatically
-	// pulled, but the image the checkpoint is based on.
-	// During checkpointing the base image of the checkpoint is stored in the
-	// checkpoint archive as NAME@DIGEST. The checkpoint archive also contains
-	// the tag with which it was initially pulled.
-	// First step is to pull NAME@DIGEST
-	containerdImage, err := c.client.Pull(ctx, config.RootfsImageRef)
+	// Resolve the image the checkpoint is based on locally first.
+	// This matches the normal container create path and avoids paying the pull
+	// path on warm restores when the base image digest is already present.
+	var (
+		image           imagestore.Image
+		containerdImage client.Image
+	)
+	image, err = c.LocalResolve(config.RootfsImageRef)
 	if err != nil {
-		return "", fmt.Errorf("failed to pull checkpoint base image %s: %w", config.RootfsImageRef, err)
+		if !errdefs.IsNotFound(err) {
+			return "", fmt.Errorf("failed to resolve checkpoint base image %s locally: %w", config.RootfsImageRef, err)
+		}
+
+		// On a cache miss, fall back to the existing pull path.
+		containerdImage, err = c.client.Pull(ctx, config.RootfsImageRef)
+		if err != nil {
+			return "", fmt.Errorf("failed to pull checkpoint base image %s: %w", config.RootfsImageRef, err)
+		}
+
+		for i := 1; i < 500; i++ {
+			// This is probably wrong. Not sure how to wait for an image to appear in
+			// the image (or content) store.
+			log.G(ctx).Debugf("Trying to resolve %s:%d", containerdImage.Name(), i)
+			image, err = c.LocalResolve(containerdImage.Name())
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Microsecond * time.Duration(i))
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve image %q during checkpoint import: %w", config.RootfsImageName, err)
+		}
+	} else {
+		containerdImage, err = c.toContainerdImage(ctx, image)
+		if err != nil {
+			return "", fmt.Errorf("failed to get checkpoint base image from containerd %q: %w", image.ID, err)
+		}
 	}
 	if _, err := reference.ParseAnyReference(config.RootfsImageName); err != nil {
 		return "", fmt.Errorf("error parsing reference: %q is not a valid repository/tag %v", config.RootfsImageName, err)
@@ -450,21 +477,6 @@ func (c *criService) CRImportCheckpoint(
 		if !errdefs.IsAlreadyExists(err) {
 			return "", fmt.Errorf("failed to tag checkpoint base image %s with %s: %w", config.RootfsImageRef, config.RootfsImageName, err)
 		}
-	}
-
-	var image imagestore.Image
-	for i := 1; i < 500; i++ {
-		// This is probably wrong. Not sure how to wait for an image to appear in
-		// the image (or content) store.
-		log.G(ctx).Debugf("Trying to resolve %s:%d", containerdImage.Name(), i)
-		image, err = c.LocalResolve(containerdImage.Name())
-		if err == nil {
-			break
-		}
-		time.Sleep(time.Microsecond * time.Duration(i))
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to resolve image %q during checkpoint import: %w", config.RootfsImageName, err)
 	}
 	imageConfig := image.ImageSpec.Config
 	env := append([]string{}, imageConfig.Env...)
